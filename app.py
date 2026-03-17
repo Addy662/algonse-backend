@@ -447,127 +447,191 @@ def options_data(ticker):
     import time
 
     INDEX_MAP = {
-        'NIFTY50':    'NIFTY',
-        'BANKNIFTY':  'BANKNIFTY',
-        'FINNIFTY':   'FINNIFTY',
-        'MIDCPNIFTY': 'MIDCPNIFTY',
+        'NIFTY50':   'NIFTY',
+        'BANKNIFTY': 'BANKNIFTY',
+        'FINNIFTY':  'FINNIFTY',
     }
 
-    is_index  = ticker in INDEX_MAP
+    is_index   = ticker in INDEX_MAP
     nse_symbol = INDEX_MAP.get(ticker, ticker)
+    yf_symbol  = STOCKS.get(ticker, ticker + '.NS')
 
+    # ── Try NSE first ─────────────────────────────────────────
     headers = {
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept':          '*/*',
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
+        'Connection':      'keep-alive',
         'Referer':         'https://www.nseindia.com/option-chain',
-        'X-Requested-With':'XMLHttpRequest',
     }
 
-    session = req.Session()
     try:
-        session.get('https://www.nseindia.com', headers=headers, timeout=10)
-        time.sleep(1)
-        session.get('https://www.nseindia.com/option-chain', headers=headers, timeout=10)
-        time.sleep(1)
+        session = req.Session()
+        session.get('https://www.nseindia.com', headers=headers, timeout=8)
+        time.sleep(1.5)
+        session.get('https://www.nseindia.com/option-chain', headers=headers, timeout=8)
+        time.sleep(1.5)
 
         if is_index:
             url = f'https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}'
         else:
             url = f'https://www.nseindia.com/api/option-chain-equities?symbol={nse_symbol}'
 
-        res  = session.get(url, headers=headers, timeout=15)
-        data = res.json()
+        res  = session.get(url, headers=headers, timeout=12)
+        if res.status_code == 200 and len(res.text) > 100:
+            data = res.json()
+            if 'records' in data:
+                records       = data['records']
+                current_price = float(records['underlyingValue'])
+                expiries      = records['expiryDates']
+                expiry        = expiries[0]
 
-        if 'records' not in data:
-            return jsonify({'error': 'No data from NSE. Market may be closed.'})
+                calls_data, puts_data = [], []
+                for item in records['data']:
+                    if item.get('expiryDate') != expiry:
+                        continue
+                    strike = item['strikePrice']
+                    if abs(strike - current_price) > current_price * 0.15:
+                        continue
+                    if 'CE' in item:
+                        ce = item['CE']
+                        calls_data.append({
+                            'strike': strike, 'lastPrice': ce.get('lastPrice', 0),
+                            'bid': ce.get('bidprice', 0), 'ask': ce.get('askPrice', 0),
+                            'volume': ce.get('totalTradedVolume', 0),
+                            'openInterest': ce.get('openInterest', 0),
+                            'iv': round(ce.get('impliedVolatility', 0), 1),
+                            'inTheMoney': strike < current_price,
+                            'changeinOI': ce.get('changeinOpenInterest', 0),
+                        })
+                    if 'PE' in item:
+                        pe = item['PE']
+                        puts_data.append({
+                            'strike': strike, 'lastPrice': pe.get('lastPrice', 0),
+                            'bid': pe.get('bidprice', 0), 'ask': pe.get('askPrice', 0),
+                            'volume': pe.get('totalTradedVolume', 0),
+                            'openInterest': pe.get('openInterest', 0),
+                            'iv': round(pe.get('impliedVolatility', 0), 1),
+                            'inTheMoney': strike > current_price,
+                            'changeinOI': pe.get('changeinOpenInterest', 0),
+                        })
 
-        records       = data['records']
-        current_price = float(records['underlyingValue'])
-        expiries      = records['expiryDates']
-        expiry        = expiries[0]
+                # Max pain
+                strikes      = sorted(set([c['strike'] for c in calls_data] + [p['strike'] for p in puts_data]))
+                max_pain_val = None
+                min_pain     = float('inf')
+                for s in strikes:
+                    total = sum(max(0, s - c['strike']) * c['openInterest'] for c in calls_data) + \
+                            sum(max(0, p['strike'] - s) * p['openInterest'] for p in puts_data)
+                    if total < min_pain:
+                        min_pain = total
+                        max_pain_val = s
 
-        calls_data = []
-        puts_data  = []
+                max_call_oi = max((c['openInterest'] for c in calls_data), default=0)
+                max_put_oi  = max((p['openInterest'] for p in puts_data),  default=0)
+                fno_signals = []
+                for c in calls_data:
+                    if c['openInterest'] >= max_call_oi * 0.7 and c['strike'] > current_price:
+                        fno_signals.append({'type':'CALL','strike':c['strike'],'premium':c['lastPrice'],'oi':c['openInterest'],'iv':c['iv'],'signal':'RESISTANCE','reason':f"High call OI at {c['strike']}"})
+                for p in puts_data:
+                    if p['openInterest'] >= max_put_oi * 0.7 and p['strike'] < current_price:
+                        fno_signals.append({'type':'PUT','strike':p['strike'],'premium':p['lastPrice'],'oi':p['openInterest'],'iv':p['iv'],'signal':'SUPPORT','reason':f"High put OI at {p['strike']}"})
 
-        for item in records['data']:
-            if item.get('expiryDate') != expiry:
-                continue
-            strike = item['strikePrice']
-            if abs(strike - current_price) > current_price * 0.15:
-                continue
-            if 'CE' in item:
-                ce = item['CE']
-                calls_data.append({
-                    'strike':       strike,
-                    'lastPrice':    ce.get('lastPrice', 0),
-                    'bid':          ce.get('bidprice', 0),
-                    'ask':          ce.get('askPrice', 0),
-                    'volume':       ce.get('totalTradedVolume', 0),
-                    'openInterest': ce.get('openInterest', 0),
-                    'iv':           round(ce.get('impliedVolatility', 0), 1),
-                    'inTheMoney':   strike < current_price,
-                    'changeinOI':   ce.get('changeinOpenInterest', 0),
+                return jsonify({
+                    'ticker': ticker, 'currentPrice': current_price,
+                    'expiry': expiry, 'expiries': expiries[:5],
+                    'calls': calls_data, 'puts': puts_data,
+                    'maxPain': max_pain_val, 'fnoSignals': fno_signals[:8],
+                    'source': 'NSE'
                 })
-            if 'PE' in item:
-                pe = item['PE']
-                puts_data.append({
-                    'strike':       strike,
-                    'lastPrice':    pe.get('lastPrice', 0),
-                    'bid':          pe.get('bidprice', 0),
-                    'ask':          pe.get('askPrice', 0),
-                    'volume':       pe.get('totalTradedVolume', 0),
-                    'openInterest': pe.get('openInterest', 0),
-                    'iv':           round(pe.get('impliedVolatility', 0), 1),
-                    'inTheMoney':   strike > current_price,
-                    'changeinOI':   pe.get('changeinOpenInterest', 0),
-                })
+    except Exception as nse_err:
+        print(f"NSE failed: {nse_err}, trying yfinance fallback...")
+
+    # ── yfinance fallback ─────────────────────────────────────
+    try:
+        stock_obj = yf.Ticker(yf_symbol)
+        hist      = stock_obj.history(period='2d')
+        if hist.empty:
+            return jsonify({'error': 'No price data available'})
+
+        current_price = round(float(hist['Close'].iloc[-1]), 2)
+        expiries_list = stock_obj.options
+
+        if not expiries_list:
+            return jsonify({
+                'ticker': ticker,
+                'currentPrice': current_price,
+                'expiry': 'N/A',
+                'expiries': [],
+                'calls': [], 'puts': [],
+                'maxPain': None, 'fnoSignals': [],
+                'source': 'yfinance',
+                'warning': 'Options chain not available via yfinance for this ticker. NSE website also blocked. Try HDFCBANK or RELIANCE.'
+            })
+
+        expiry = expiries_list[0]
+        chain  = stock_obj.option_chain(expiry)
+        calls  = chain.calls
+        puts   = chain.puts
+
+        low  = current_price * 0.82
+        high = current_price * 1.18
+        calls = calls[(calls['strike'] >= low) & (calls['strike'] <= high)]
+        puts  = puts[(puts['strike'] >= low)  & (puts['strike'] <= high)]
+
+        def clean_yf(df, is_call):
+            result = []
+            for _, r in df.iterrows():
+                try:
+                    result.append({
+                        'strike':       round(float(r['strike']), 2),
+                        'lastPrice':    round(float(r['lastPrice']), 2),
+                        'bid':          round(float(r.get('bid', 0)), 2),
+                        'ask':          round(float(r.get('ask', 0)), 2),
+                        'volume':       int(r.get('volume', 0)) if str(r.get('volume','nan')) != 'nan' else 0,
+                        'openInterest': int(r.get('openInterest', 0)) if str(r.get('openInterest','nan')) != 'nan' else 0,
+                        'iv':           round(float(r.get('impliedVolatility', 0)) * 100, 1),
+                        'inTheMoney':   bool(r.get('inTheMoney', False)),
+                        'changeinOI':   0,
+                    })
+                except:
+                    continue
+            return result
+
+        calls_data = clean_yf(calls, True)
+        puts_data  = clean_yf(puts,  False)
 
         strikes      = sorted(set([c['strike'] for c in calls_data] + [p['strike'] for p in puts_data]))
         max_pain_val = None
         min_pain     = float('inf')
         for s in strikes:
-            call_pain = sum(max(0, s - c['strike']) * c['openInterest'] for c in calls_data)
-            put_pain  = sum(max(0, p['strike'] - s) * p['openInterest'] for p in puts_data)
-            total = call_pain + put_pain
+            total = sum(max(0, s - c['strike']) * c['openInterest'] for c in calls_data) + \
+                    sum(max(0, p['strike'] - s) * p['openInterest'] for p in puts_data)
             if total < min_pain:
-                min_pain     = total
+                min_pain = total
                 max_pain_val = s
 
-        max_call_oi  = max((c['openInterest'] for c in calls_data), default=0)
-        max_put_oi   = max((p['openInterest'] for p in puts_data),  default=0)
-        fno_signals  = []
+        max_call_oi = max((c['openInterest'] for c in calls_data), default=0)
+        max_put_oi  = max((p['openInterest'] for p in puts_data),  default=0)
+        fno_signals = []
         for c in calls_data:
-            if c['openInterest'] >= max_call_oi * 0.7 and c['strike'] > current_price:
-                fno_signals.append({
-                    'type': 'CALL', 'strike': c['strike'],
-                    'premium': c['lastPrice'], 'oi': c['openInterest'],
-                    'iv': c['iv'], 'signal': 'RESISTANCE',
-                    'reason': f"Highest call OI — strong resistance at {c['strike']}"
-                })
+            if c['openInterest'] >= max_call_oi * 0.6 and c['strike'] > current_price:
+                fno_signals.append({'type':'CALL','strike':c['strike'],'premium':c['lastPrice'],'oi':c['openInterest'],'iv':c['iv'],'signal':'RESISTANCE','reason':f"High call OI at {c['strike']}"})
         for p in puts_data:
-            if p['openInterest'] >= max_put_oi * 0.7 and p['strike'] < current_price:
-                fno_signals.append({
-                    'type': 'PUT', 'strike': p['strike'],
-                    'premium': p['lastPrice'], 'oi': p['openInterest'],
-                    'iv': p['iv'], 'signal': 'SUPPORT',
-                    'reason': f"Highest put OI — strong support at {p['strike']}"
-                })
+            if p['openInterest'] >= max_put_oi * 0.6 and p['strike'] < current_price:
+                fno_signals.append({'type':'PUT','strike':p['strike'],'premium':p['lastPrice'],'oi':p['openInterest'],'iv':p['iv'],'signal':'SUPPORT','reason':f"High put OI at {p['strike']}"})
 
         return jsonify({
-            'ticker':       ticker,
-            'currentPrice': current_price,
-            'expiry':       expiry,
-            'expiries':     expiries[:5],
-            'calls':        calls_data,
-            'puts':         puts_data,
-            'maxPain':      max_pain_val,
-            'fnoSignals':   fno_signals[:8],
+            'ticker': ticker, 'currentPrice': current_price,
+            'expiry': expiry, 'expiries': expiries_list[:5],
+            'calls': calls_data, 'puts': puts_data,
+            'maxPain': max_pain_val, 'fnoSignals': fno_signals[:8],
+            'source': 'yfinance'
         })
 
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({'error': f'Both NSE and yfinance failed: {str(e)}'})
 
 @app.route('/api/screener')
 def screener():
