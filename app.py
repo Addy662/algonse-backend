@@ -12,7 +12,7 @@ from kiteconnect import KiteConnect
 load_dotenv()
 
 API_KEY    = os.getenv('wsxfjnzu7qmik2s8')
-API_SECRET = os.getenv('vuwpdbc1d1297pwt6u0rz9xxcy45fhym')
+API_SECRET = os.getenv('tuszjo0pumb60d6ymjuedjskwudyd16i')
 
 kite_sessions = {}  # stores access tokens per user
 app = Flask(__name__)
