@@ -1,11 +1,20 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, redirect
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests as req
 import time
+import os
+from dotenv import load_dotenv
+from kiteconnect import KiteConnect
 
+load_dotenv()
+
+API_KEY    = os.getenv('wsxfjnzu7qmik2s8')
+API_SECRET = os.getenv('vuwpdbc1d1297pwt6u0rz9xxcy45fhym')
+
+kite_sessions = {}  # stores access tokens per user
 app = Flask(__name__)
 CORS(app)
 
@@ -471,6 +480,210 @@ def check_alerts():
                 })
         except: continue
     return jsonify(triggered)
+
+# ── Zerodha Auth ─────────────────────────────────────────────────
+
+@app.route('/api/broker/login-url')
+def broker_login_url():
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        url  = kite.login_url()
+        return jsonify({'url': url})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/callback')
+def broker_callback():
+    request_token = request.args.get('request_token')
+    if not request_token:
+        return jsonify({'error': 'No request token received'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        data = kite.generate_session(request_token, api_secret=API_SECRET)
+        access_token = data['access_token']
+        user_id      = data['user_id']
+        kite_sessions[user_id] = access_token
+        # Redirect to frontend with token
+        from flask import redirect
+        return redirect(f'http://localhost:5173/broker?token={access_token}&user_id={user_id}')
+    except Exception as e:
+        return redirect(f'http://localhost:5173/broker?error={str(e)}')
+
+
+@app.route('/api/broker/profile')
+def broker_profile():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        profile = kite.profile()
+        margins = kite.margins()
+        return jsonify({
+            'user_id':    profile['user_id'],
+            'user_name':  profile['user_name'],
+            'email':      profile['email'],
+            'broker':     profile['broker'],
+            'equity_margin': margins.get('equity', {}).get('available', {}).get('live_balance', 0),
+            'commodity_margin': margins.get('commodity', {}).get('available', {}).get('live_balance', 0),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/positions')
+def broker_positions():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        positions = kite.positions()
+        net = positions.get('net', [])
+        result = []
+        for p in net:
+            if p['quantity'] == 0:
+                continue
+            result.append({
+                'symbol':       p['tradingsymbol'],
+                'exchange':     p['exchange'],
+                'product':      p['product'],
+                'quantity':     p['quantity'],
+                'avg_price':    round(p['average_price'], 2),
+                'ltp':          round(p['last_price'], 2),
+                'pnl':          round(p['pnl'], 2),
+                'pnl_pct':      round((p['pnl'] / (p['average_price'] * abs(p['quantity'])) * 100), 2) if p['average_price'] > 0 else 0,
+                'value':        round(p['last_price'] * abs(p['quantity']), 2),
+                'type':         'LONG' if p['quantity'] > 0 else 'SHORT',
+            })
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/pnl')
+def broker_pnl():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        positions = kite.positions()
+        net = positions.get('net', [])
+        total_pnl      = sum(p['pnl'] for p in net)
+        realised_pnl   = sum(p['realised'] for p in net)
+        unrealised_pnl = sum(p['unrealised'] for p in net)
+        winners        = [p for p in net if p['pnl'] > 0]
+        losers         = [p for p in net if p['pnl'] < 0]
+        return jsonify({
+            'total_pnl':      round(total_pnl, 2),
+            'realised_pnl':   round(realised_pnl, 2),
+            'unrealised_pnl': round(unrealised_pnl, 2),
+            'total_positions':len(net),
+            'winners':        len(winners),
+            'losers':         len(losers),
+            'win_rate':       round(len(winners)/len(net)*100, 1) if net else 0,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/orders')
+def broker_orders():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        orders = kite.orders()
+        result = []
+        for o in orders:
+            result.append({
+                'order_id':       o['order_id'],
+                'symbol':         o['tradingsymbol'],
+                'exchange':       o['exchange'],
+                'transaction':    o['transaction_type'],
+                'order_type':     o['order_type'],
+                'product':        o['product'],
+                'quantity':       o['quantity'],
+                'price':          round(o['price'], 2),
+                'avg_price':      round(o['average_price'], 2),
+                'status':         o['status'],
+                'placed_at':      str(o['order_timestamp']),
+            })
+        return jsonify(list(reversed(result)))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/trades')
+def broker_trades():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        trades = kite.trades()
+        result = []
+        for t in trades:
+            result.append({
+                'trade_id':    t['trade_id'],
+                'order_id':    t['order_id'],
+                'symbol':      t['tradingsymbol'],
+                'exchange':    t['exchange'],
+                'transaction': t['transaction_type'],
+                'product':     t['product'],
+                'quantity':    t['quantity'],
+                'price':       round(t['price'], 2),
+                'filled_at':   str(t['fill_timestamp']),
+            })
+        return jsonify(list(reversed(result)))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/place-order', methods=['POST'])
+def place_order():
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        data       = request.json
+        kite       = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        order_id   = kite.place_order(
+            tradingsymbol = data['symbol'],
+            exchange      = data.get('exchange', 'NSE'),
+            transaction_type = data['transaction'],
+            quantity      = int(data['quantity']),
+            order_type    = data.get('order_type', 'MARKET'),
+            product       = data.get('product', 'MIS'),
+            price         = data.get('price', 0),
+            variety       = data.get('variety', 'regular'),
+        )
+        return jsonify({'success': True, 'order_id': order_id})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/broker/cancel-order/<order_id>', methods=['DELETE'])
+def cancel_order(order_id):
+    token = request.headers.get('X-Kite-Token')
+    if not token:
+        return jsonify({'error': 'Not authenticated'})
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(token)
+        kite.cancel_order(variety='regular', order_id=order_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
