@@ -13,8 +13,7 @@ load_dotenv()
 
 API_KEY    = os.getenv('ZERODHA_API_KEY')
 API_SECRET = os.getenv('ZERODHA_API_SECRET')
-print("API_KEY:", API_KEY)
-print("API_SECRET:", API_SECRET)
+
 kite_sessions = {}  # stores access tokens per user
 app = Flask(__name__)
 CORS(app)
